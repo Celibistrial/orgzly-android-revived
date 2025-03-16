@@ -15,6 +15,9 @@ import androidx.lifecycle.map
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import androidx.sqlite.db.SupportSQLiteQuery
 import androidx.sqlite.db.SupportSQLiteQueryBuilder
+import com.google.gson.Gson
+import com.google.gson.JsonObject
+import com.google.gson.JsonSyntaxException
 import com.orgzly.BuildConfig
 import com.orgzly.R
 import com.orgzly.android.*
@@ -22,6 +25,7 @@ import com.orgzly.android.data.mappers.OrgMapper
 import com.orgzly.android.db.NotesClipboard
 import com.orgzly.android.db.OrgzlyDatabase
 import com.orgzly.android.db.dao.NoteDao
+import com.orgzly.android.db.dao.NoteDao.NoteIdBookId
 import com.orgzly.android.db.dao.NoteViewDao
 import com.orgzly.android.db.dao.ReminderTimeDao
 import com.orgzly.android.db.entity.*
@@ -1162,11 +1166,15 @@ class DataRepository @Inject constructor(
         })
     }
 
-    fun updateNoteContent(bookId: Long, noteId: Long, content: String?) {
+    fun updateNoteContent(noteId: Long, content: String?) {
         db.runInTransaction {
             db.note().updateContent(noteId, content, MiscUtils.lineCount(content))
 
-            updateBookIsModified(bookId, true)
+            val note = db.note().get(noteId)!!
+
+            tryUpdateTitleCookies(note)
+
+            updateBookIsModified(note.position.bookId, true)
         }
     }
 
@@ -1505,6 +1513,19 @@ class DataRepository @Inject constructor(
 
         db.noteAncestor().insertAncestorsForNote(noteId)
 
+        val doneKeywords = AppPreferences.doneKeywordsSet(context)
+        val todoKeywords = AppPreferences.todoKeywordsSet(context)
+
+        if (doneKeywords.contains(notePayload.state) || todoKeywords.contains(notePayload.state)) {
+            val ancestors = getNoteAncestors(noteId)
+
+            if (ancestors.isNotEmpty()) {
+                tryUpdateTitleCookies(ancestors.last())
+            }
+        }
+
+        tryUpdateTitleCookies(noteEntity.copy(id = noteId))
+
         updateBookIsModified(target.bookId, true, time)
 
         return noteEntity.copy(id = noteId)
@@ -1545,7 +1566,14 @@ class DataRepository @Inject constructor(
 
 
     fun updateNote(noteId: Long, notePayload: NotePayload): Note? {
-        val note = db.note().get(noteId) ?: return null
+        val noteAndParent = db.note().getNoteAndParent(noteId)
+
+        if (noteAndParent.isEmpty()) return null
+
+        val ancestors = noteAndParent.dropLast(1)
+
+        val note = noteAndParent.last()
+        val noteParent = if (ancestors.isEmpty()) null else ancestors.last()
 
         return db.runInTransaction(Callable {
             updateBookIsModified(note.position.bookId, true)
@@ -1567,10 +1595,56 @@ class DataRepository @Inject constructor(
 
             val count = db.note().update(newNote)
 
+            // first we try to update our title in case we have child tasks or checkboxes
+            tryUpdateTitleCookies(newNote)
+
             if (BuildConfig.LOG_DEBUG) LogUtils.d(TAG, "Updated $count note: $newNote")
+
+            // then we try to update our parent's title in case we're a child task with a
+            // todo/done state
+            if (newNote.state != note.state && noteParent != null) {
+                tryUpdateTitleCookies(noteParent)
+            }
 
             newNote
         })
+    }
+
+    private fun tryUpdateTitleCookies(note: Note) {
+        // as of my testing in org 9.6.15, if a heading has child headings which are TODO items
+        // as well as content which are checkboxes, it's unpredictable how the title changes, but:
+        //
+        // 1. it does NOT count both the checkboxes and child headings together, but rather favors
+        //    one or the other
+        // 2. it seems to favor them in the order they appear (top-down), but also somehow seems to
+        //    favor child headings more
+        //
+        // for sanity's sake, we're just going to process for any checkboxes and then process for
+        // any children, in that order
+
+        val doneKeywords = AppPreferences.doneKeywordsSet(context)
+        val todoKeywords = AppPreferences.todoKeywordsSet(context)
+
+        val titleUpdater = StateChangeParentTitleUpdater(todoKeywords, doneKeywords)
+
+        var newTitle = if (note.content.isNullOrEmpty()) note.title
+            else titleUpdater.updateTitleForPossibleCheckboxes(note.title, note.content)
+
+        val children = getNoteChildren(note.id)
+
+        if (children.any()) {
+            newTitle = titleUpdater.updateTitleForChildStates(newTitle, children.map { it.state })
+        }
+
+        if (newTitle == note.title) {
+            return
+        }
+
+        val newNote = note.copy(title = newTitle)
+
+        val count = db.note().update(newNote)
+
+        if (BuildConfig.LOG_DEBUG) LogUtils.d(TAG, "Updated $count note: $newNote")
     }
 
     fun deleteNotes(bookId: Long, ids: Set<Long>): Int {
@@ -1987,15 +2061,82 @@ class DataRepository @Inject constructor(
         NotesOrgExporter(this).exportBook(book, writer)
     }
 
-    fun findNoteHavingProperty(name: String, value: String): NoteDao.NoteIdBookId? {
-        return db.note().firstNoteHavingPropertyLowerCase(name.lowercase(), value.lowercase())
+    fun findNotesHavingProperty(name: String, value: String): List<NoteIdBookId> {
+        return db.note().allNotesHavingPropertyLowerCase(name.lowercase(), value.lowercase())
     }
 
-    fun findNoteOrBookHavingProperty(name: String, value: String): Any? {
-        val foundNote = findNoteHavingProperty(name, value)
-        if (foundNote != null)
+    fun findNotesOrBooksHavingProperty(name: String, value: String): List<Any?> {
+        val foundNote = findNotesHavingProperty(name, value)
+        if (foundNote.isNotEmpty())
             return foundNote
-        return db.book().firstBookHavingPropertyLowerCase(name.lowercase(), value.lowercase())
+        return db.book().allBooksHavingPropertyLowerCase(name.lowercase(), value.lowercase())
+    }
+
+    fun findUniqueNoteHavingProperty(name: String, value: String): NoteIdBookId? {
+        val foundNotes = db.note().allNotesHavingPropertyLowerCase(name.lowercase(), value.lowercase())
+        return if (foundNotes.isEmpty()) null
+        else if (foundNotes.size == 1) foundNotes[0]
+        else {
+            val msg = App.getAppContext().getString(R.string.error_multiple_notes_with_matching_property_value, name, value)
+            throw RuntimeException(msg)
+        }
+    }
+
+    fun exportSettingsAndSearchesToNote(note: Note) {
+        val notePayload = getNotePayload(note.id) ?: throw RuntimeException(context.getString(R.string.failed_to_get_note_payload))
+        var noteIdPropertyValue = notePayload.properties.get("ID")
+        if (noteIdPropertyValue == null) {
+            // Note has no "ID" property - let's add one
+            noteIdPropertyValue = UUID.randomUUID().toString()
+            notePayload.properties.put("ID", noteIdPropertyValue)
+            updateNote(note.id, notePayload)
+        }
+        // Ensure that the note's "ID" property value is unique
+        val targetNote = findUniqueNoteHavingProperty("ID", noteIdPropertyValue)
+        // Get settings as JSON
+        val settingsJsonObject = AppPreferences.getDefaultPrefsAsJsonObject(context)
+        // Get saved searches as JSON
+        val savedSearchesJsonObject = Gson().fromJson("{}", JsonObject::class.java)
+        getSavedSearches().forEach {
+            savedSearchesJsonObject.addProperty(it.name, it.query)
+        }
+        // Put them together
+        val finalMap = mapOf("settings" to settingsJsonObject, "saved_searches" to savedSearchesJsonObject)
+        val finalJsonString = Gson().toJson(finalMap)
+        updateNoteContent(targetNote!!.noteId, finalJsonString)
+        AppPreferences.settingsExportAndImportNoteId(context, noteIdPropertyValue)
+    }
+
+    fun importSettingsAndSearchesFromNote(note: Note) {
+        var importedSomething = false
+        val notePayload = getNotePayload(note.id) ?: throw RuntimeException(
+            context.getString(R.string.failed_to_get_note_payload))
+        if (notePayload.content.isNullOrEmpty())
+            throw RuntimeException(context.getString(R.string.note_has_no_content))
+        val gson: Map<*, *>
+        try {
+            gson = Gson().fromJson(notePayload.content, Map::class.java)
+        } catch (e: JsonSyntaxException) {
+            throw RuntimeException(context.getString(R.string.note_does_not_contain_valid_json))
+        }
+        if (!("settings" in gson.keys && "saved_searches" in gson.keys)) // Both keys must be present
+            throw RuntimeException(context.getString(R.string.imported_json_is_missing_mandatory_fields))
+        val settings = gson["settings"] as Map<String, *>
+        if (settings.isNotEmpty()) {
+            AppPreferences.setDefaultPrefsFromJsonMap(context, settings)
+            importedSomething = true
+        }
+        val savedSearches: List<SavedSearch> = (gson["saved_searches"] as Map<String, String>)
+            .entries
+            .mapIndexed { index, entry ->
+                SavedSearch(0, entry.key, entry.value, index + 1)
+            }
+        if (savedSearches.isNotEmpty()) {
+            replaceSavedSearches(savedSearches)
+            importedSomething = true
+        }
+        if (!importedSomething)
+            throw RuntimeException("Found no settings or saved searches to import.")
     }
 
     /*
